@@ -45,6 +45,7 @@ kubectl create quota bank-vaults --hard=cpu=4,memory=8G,pods=10,services=10,repl
 helm dependency build ./charts/vault-operator
 helm upgrade --install vault-operator ./charts/vault-operator \
     --set image.tag=latest \
+    --set image.bankVaultsTag=latest \
     --set image.pullPolicy=IfNotPresent \
     --set etcd-operator.enabled=true \
     --set etcd-operator.deployments.backupOperator=false \
@@ -94,7 +95,6 @@ kubectl delete secret vault-unseal-keys
 kubectl delete pvc --all
 
 # Fifth test: single node cluster with defined PriorityClass via vaultPodSpec and vaultConfigurerPodSpec
-kubectl create clusterrolebinding oidc-reviewer --clusterrole=system:service-account-issuer-discovery --group=system:unauthenticated
 kubectl apply -f operator/deploy/priorityclass.yaml
 kubectl apply -f operator/deploy/cr-priority.yaml
 kubectl wait --for=condition=healthy --timeout=120s vault/vault
@@ -117,6 +117,7 @@ kubectl delete pvc --all
 
 # Sixth test: Run the OIDC authenticated client test
 kubectl create namespace vswh # create the namespace beforehand, because we need the CA cert here as well
+kubectl create clusterrolebinding oidc-reviewer --clusterrole=system:service-account-issuer-discovery --group=system:unauthenticated
 kubectl apply -f operator/deploy/cr-oidc.yaml
 kubectl wait --for=condition=healthy --timeout=120s vault/vault
 

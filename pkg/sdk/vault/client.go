@@ -32,10 +32,10 @@ import (
 	"emperror.dev/errors"
 	"github.com/fsnotify/fsnotify"
 	vaultapi "github.com/hashicorp/vault/api"
+	"github.com/leosayous21/go-azure-msi/msi"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/iam/v1"
 	credentialspb "google.golang.org/genproto/googleapis/iam/credentials/v1"
-	"k8s.io/client-go/rest"
 )
 
 const (
@@ -151,6 +151,11 @@ const (
 	// - https://www.vaultproject.io/docs/auth/kubernetes
 	// - https://www.vaultproject.io/docs/auth/gcp
 	JWTAuthMethod ClientAuthMethod = "jwt"
+
+	// AzureMSIAuthMethod is used for the vault Azure auth method
+	// as described here:
+	// - https://www.vaultproject.io/docs/auth/azure
+	AzureMSIAuthMethod ClientAuthMethod = "azure"
 )
 
 // Client is a Vault client with Kubernetes support, token automatic renewing and
@@ -161,7 +166,7 @@ type Client struct {
 
 	client       *vaultapi.Client
 	logical      *vaultapi.Logical
-	tokenRenewer *vaultapi.Renewer
+	tokenWatcher *vaultapi.Renewer
 	closed       bool
 	watch        *fsnotify.Watcher
 	mu           sync.Mutex
@@ -261,7 +266,7 @@ func NewClientFromRawClient(rawClient *vaultapi.Client, opts ...ClientOption) (*
 		logger:  noopLogger{},
 	}
 
-	var tokenRenewer *vaultapi.Renewer
+	var tokenWatcher *vaultapi.Renewer
 
 	o := &clientOptions{}
 
@@ -323,17 +328,9 @@ func NewClientFromRawClient(rawClient *vaultapi.Client, opts ...ClientOption) (*
 		if err == nil {
 			rawClient.SetToken(string(token))
 		} else {
-			// If VAULT_TOKEN, VAULT_TOKEN_PATH or ~/.vault-token wasn't provided let's
-			// suppose we are in Kubernetes and try to get one with the Kubernetes ServiceAccount JWT.
-			//
-			// This logic works for for Vault GCP authentication as well, see:
-			// https://www.vaultproject.io/api/auth/gcp#login
-
-			// Check that we are in Kubernetes
-			_, err := rest.InClusterConfig()
-			if err != nil {
-				return nil, err
-			}
+			// If VAULT_TOKEN, VAULT_TOKEN_PATH or ~/.vault-token wasn't provided,
+			// attempt to get one with supported JWT-based authentication methods
+			// (such as Kubernetes ServiceAccount JWT).
 
 			jwtFile := defaultJWTFile
 			if file := os.Getenv("KUBERNETES_SERVICE_ACCOUNT_TOKEN"); file != "" {
@@ -435,6 +432,26 @@ func NewClientFromRawClient(rawClient *vaultapi.Client, opts ...ClientOption) (*
 					}, nil
 				}
 
+			case AzureMSIAuthMethod:
+				loginDataFunc = func() (map[string]interface{}, error) {
+					metadata, err := msi.GetInstanceMetadata()
+					if err != nil {
+						return nil, err
+					}
+					token, err := msi.GetMsiToken()
+					if err != nil {
+						return nil, err
+					}
+					return map[string]interface{}{
+						"role":                o.role,
+						"jwt":                 token.AccessToken,
+						"subscription_id":     metadata.SubscriptionId,
+						"resource_group_name": metadata.ResourceGroupName,
+						"vm_name":             metadata.VMName,
+						"vmss_name":           metadata.VMssName,
+					}, nil
+				}
+
 			default:
 				loginDataFunc = func() (map[string]interface{}, error) {
 					// Projected SA JWTs do expire, so we need to move the reading logic into the loop
@@ -485,7 +502,11 @@ func NewClientFromRawClient(rawClient *vaultapi.Client, opts ...ClientOption) (*
 						continue
 					}
 
-					client.logger.Info("received new Vault token")
+					client.logger.Info("received new Vault token", map[string]interface{}{
+						"addr": o.url,
+						"role": o.role,
+						"path": o.authPath,
+					})
 
 					// Set the first token from the response
 					rawClient.SetToken(secret.Auth.ClientToken)
@@ -496,19 +517,19 @@ func NewClientFromRawClient(rawClient *vaultapi.Client, opts ...ClientOption) (*
 					}
 
 					// Start the renewing process
-					tokenRenewer, err = rawClient.NewRenewer(&vaultapi.RenewerInput{Secret: secret})
+					tokenWatcher, err = rawClient.NewLifetimeWatcher(&vaultapi.LifetimeWatcherInput{Secret: secret})
 					if err != nil {
-						client.logger.Error("failed to renew Vault token", map[string]interface{}{"err": err})
+						client.logger.Error("failed to watch Vault token", map[string]interface{}{"err": err})
 						continue
 					}
 
 					client.mu.Lock()
-					client.tokenRenewer = tokenRenewer
+					client.tokenWatcher = tokenWatcher
 					client.mu.Unlock()
 
-					go tokenRenewer.Renew()
+					go tokenWatcher.Start()
 
-					client.runRenewChecker(tokenRenewer)
+					client.runRenewChecker(tokenWatcher)
 				}
 
 				client.logger.Info("Vault token renewal closed")
@@ -528,15 +549,15 @@ func NewClientFromRawClient(rawClient *vaultapi.Client, opts ...ClientOption) (*
 	return client, nil
 }
 
-func (client *Client) runRenewChecker(tokenRenewer *vaultapi.Renewer) {
+func (client *Client) runRenewChecker(tokenWatcher *vaultapi.Renewer) {
 	for {
 		select {
-		case err := <-tokenRenewer.DoneCh():
+		case err := <-tokenWatcher.DoneCh():
 			if err != nil {
 				client.logger.Error("error in Vault token renewal", map[string]interface{}{"err": err})
 			}
 			return
-		case o := <-tokenRenewer.RenewCh():
+		case o := <-tokenWatcher.RenewCh():
 			ttl, _ := o.Secret.TokenTTL()
 			client.logger.Info("renewed Vault token", map[string]interface{}{"ttl": ttl})
 		}
@@ -561,8 +582,8 @@ func (client *Client) Close() {
 
 	client.closed = true
 
-	if client.tokenRenewer != nil {
-		client.tokenRenewer.Stop()
+	if client.tokenWatcher != nil {
+		client.tokenWatcher.Stop()
 	}
 
 	if client.watch != nil {

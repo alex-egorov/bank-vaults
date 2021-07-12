@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"emperror.dev/errors"
+	"github.com/cristalhq/jwt/v3"
 	"github.com/hashicorp/hcl"
 	hclPrinter "github.com/hashicorp/hcl/hcl/printer"
 	"github.com/hashicorp/vault/api"
@@ -93,10 +94,10 @@ type Vault interface {
 	Active() (bool, error)
 	Unseal() error
 	Leader() (bool, error)
+	LeaderAddress() (string, error)
 	Configure(config *viper.Viper) error
 }
 
-//
 type KVService interface {
 	Set(key string, value []byte) error
 	Get(key string) ([]byte, error)
@@ -163,6 +164,15 @@ func (v *vault) Leader() (bool, error) {
 	}
 
 	return resp.IsSelf, nil
+}
+
+func (v *vault) LeaderAddress() (string, error) {
+	resp, err := v.cl.Sys().Leader()
+	if err != nil {
+		return "", errors.Wrap(err, "error checking leader address")
+	}
+
+	return resp.LeaderAddress, nil
 }
 
 // Unseal will attempt to unseal vault by retrieving keys from the kms service
@@ -510,10 +520,21 @@ func (v *vault) kubernetesAuthConfigDefault() (map[string]interface{}, error) {
 	if err != nil {
 		return nil, errors.WrapIf(err, "failed to read serviceaccount token")
 	}
+	token, err := jwt.Parse(tokenReviewerJWT)
+	if err != nil {
+		return nil, errors.WrapIf(err, "failed to parse serviceaccount token")
+	}
+	var claims jwt.StandardClaims
+	err = json.Unmarshal(token.RawClaims(), &claims)
+	if err != nil {
+		return nil, errors.WrapIf(err, "failed to get serviceaccount token claims")
+	}
+
 	config := map[string]interface{}{
 		"kubernetes_host":    fmt.Sprint("https://", os.Getenv("KUBERNETES_SERVICE_HOST")),
 		"kubernetes_ca_cert": string(kubernetesCACert),
 		"token_reviewer_jwt": string(tokenReviewerJWT),
+		"issuer":             claims.Issuer,
 	}
 
 	return config, nil
@@ -1195,7 +1216,7 @@ func (v *vault) configureSecretEngines(config *viper.Viper) error {
 
 				shouldUpdate := true
 				if (createOnly || rotate) && mountExists {
-					var sec interface{}
+					secretExists := false
 					if configOption == "root/generate" { // the pki generate call is a different beast
 						req := v.cl.NewRequest("GET", fmt.Sprintf("/v1/%s/ca", path))
 						resp, err := v.cl.RawRequestWithContext(context.Background(), req)
@@ -1206,16 +1227,19 @@ func (v *vault) configureSecretEngines(config *viper.Viper) error {
 							return errors.Wrapf(err, "failed to check pki CA")
 						}
 						if resp.StatusCode == http.StatusOK {
-							sec = true
+							secretExists = true
 						}
 					} else {
-						sec, err = v.cl.Logical().Read(configPath)
+						secret, err := v.cl.Logical().Read(configPath)
 						if err != nil {
 							return errors.Wrapf(err, "error reading configPath %s", configPath)
 						}
+						if secret != nil && secret.Data != nil {
+							secretExists = true
+						}
 					}
 
-					if sec != nil {
+					if secretExists {
 						reason := "rotate"
 						if createOnly {
 							reason = "create_only"
